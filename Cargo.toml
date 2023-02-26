@@ -1,0 +1,10 @@
+[package]
+name = "curser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tui = "0.19"
+tui-textarea = "0.2"
+crossterm = "0.25"
+tokio = { version = "1.25", features = ["full"] }
