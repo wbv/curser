@@ -1,41 +1,49 @@
-use std::{io, time::Duration};
+use std::io;
+
+use tokio::time::{Duration, Instant};
+use tokio_stream::StreamExt;
 use tui::{
     backend::CrosstermBackend,
-    widgets::{
-        Block,
-        Borders,
-    },
+    style::Style,
+    widgets::{Block, Borders, Paragraph},
+    Frame,
 };
-use tui_textarea::{Input, Key};
-
+use tui_textarea::{Input, Key, TextArea};
 
 type Backend = tui::backend::CrosstermBackend<io::Stdout>;
 
-struct ChatUI<'a> {
-    inputbox: tui_textarea::TextArea<'a>,
+fn reset_inputbox<'a>() -> TextArea<'a> {
+    let mut inputbox = TextArea::default();
+    inputbox.set_tab_length(0);
+    inputbox.set_max_histories(0);
+    inputbox.remove_line_number();
+    inputbox.set_cursor_line_style(Style::default());
+    inputbox
 }
 
-impl<'a> ChatUI<'a> {
+struct ChatState<'a> {
+    status: String,
+    messages: Vec<String>,
+    inputbox: TextArea<'a>,
+}
+
+impl<'a> ChatState<'a> {
     pub fn new() -> io::Result<Self> {
-        let backend = CrosstermBackend::new(io::stdout());
-        let inputbox = tui_textarea::TextArea::default();
+        let status = String::new();
+        let messages = Vec::new();
+        let inputbox = reset_inputbox();
 
-        Ok(Self { inputbox })
+        Ok(Self {
+            status,
+            messages,
+            inputbox,
+        })
     }
 
-    //fn draw(&mut self) -> io::Result<()> {
-    //    self.terminal.draw(|f| self.render(f))?;
-    //    Ok(())
-    //}
-
-    fn set_inputbox(&mut self, input: Input) {
-        self.inputbox.input(input);
-    }
-
-    fn render(inputbox: &tui_textarea::TextArea, f: &mut tui::Frame<Backend>) {
+    fn render(&self, f: &mut Frame<Backend>) {
         const UI_CONSTRAINTS: [tui::layout::Constraint; 3] = [
             tui::layout::Constraint::Length(3), // status area: 1 line (+ border top/bottom)
-            tui::layout::Constraint::Min(12),   // chat area: at least 10 lines (+ border top/bottom)
+            tui::layout::Constraint::Min(12), // chat area: at least 10 lines (+ border top/bottom)
             tui::layout::Constraint::Length(1), // input area: just one line
         ];
 
@@ -45,72 +53,91 @@ impl<'a> ChatUI<'a> {
             .split(f.size());
 
         if sections.len() != 3 {
-            let msg = format!("Couldn't create all 3 UI sections (found {})", sections.len());
-            Self::render_err(f, msg);
+            let msg = format!(
+                "Couldn't create all 3 UI sections (only got {})",
+                sections.len()
+            );
+            render_err(f, msg.as_str());
             return;
         }
 
-        let (status, chat, input) = (sections[0], sections[1], sections[2]);
-
-        // render each block with dummy text
-        let text = tui::widgets::Paragraph::new("Status: stats | Other stats: here!")
-            .block(Block::default()
-                   .title("status")
-                   .borders(Borders::ALL));
-        f.render_widget(text, status);
-        let text = tui::widgets::Paragraph::new("chat will go here\n and here!")
-            .block(Block::default()
-                   .title("chat")
-                   .borders(Borders::ALL));
-        f.render_widget(text, chat);
-        f.render_widget(inputbox.widget(), input);
-    }
-
-    fn render_err(f: &mut tui::Frame<Backend>, msg: String) {
-        let par = tui::widgets::Paragraph::new(msg);
-        let block = Block::default()
-            .title("UI Error");
-        let par = par.block(block);
-        f.render_widget(par, f.size());
+        let status = Paragraph::new(self.status.clone())
+            .block(Block::default().title("status").borders(Borders::ALL));
+        let messages = Paragraph::new(self.messages.join("\n"))
+            .block(Block::default().title("chat").borders(Borders::ALL));
+        let (status_chunk, messages_chunk, input_chunk) = (sections[0], sections[1], sections[2]);
+        f.render_widget(status, status_chunk);
+        f.render_widget(messages, messages_chunk);
+        f.render_widget(self.inputbox.widget(), input_chunk);
     }
 }
 
-
-fn main() -> Result<(), io::Error> {
-    tokio::runtime::Runtime::new().unwrap().block_on(run())
+fn render_err(f: &mut Frame<Backend>, msg: &str) {
+    let par = Paragraph::new(msg);
+    let block = Block::default().title("UI Error");
+    let par = par.block(block);
+    f.render_widget(par, f.size());
 }
 
-/// Primary run-loop
-async fn run() -> Result<(), io::Error> {
+fn random_duration() -> Duration {
+    Duration::from_secs(4).mul_f64(fastrand::f64())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), io::Error> {
     // first: move to alternate terminal mode
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(
-        io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-    )?;
+    crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen,)?;
 
     let mut terminal = tui::Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut ui = ChatUI::new()?;
+    let mut state = ChatState::new()?;
+    let mut input_reader = crossterm::event::EventStream::new();
+
+    // background timer randomly adds messages
+    let timer = tokio::time::sleep(random_duration());
+    tokio::pin!(timer);
+
+    // status gets updated with these counters
+    let (mut rx, mut tx) = (0, 0);
 
     loop {
-        terminal.draw(|f| ChatUI::render(&ui.inputbox, f))?;
+        state.status = format!("Messages sent: {tx:4}  Messages received: {rx:4}");
+        terminal.draw(|f| state.render(f))?;
 
-        match crossterm::event::read()?.into() {
-            Input { key: Key::Esc, .. } => break,
-            input => {
-                ui.set_inputbox(input);
+        tokio::select! {
+            try_event = input_reader.next() => {
+                // feed key events into the inputbox
+                if let Some(Ok(crossterm::event::Event::Key(e))) = try_event {
+                    match e.into() {
+                        // Esc key --> quit
+                        Input { key: Key::Esc, .. } => break,
+                        // Enter key --> send message
+                        Input { key: Key::Enter, .. } => {
+                            let newmsg = state.inputbox.lines().join("\n");
+                            state.messages.push(newmsg);
+                            state.inputbox = reset_inputbox();
+                            tx += 1;
+                        }
+                        // all other keys --> update input
+                        i => {
+                            state.inputbox.input(i);
+                            continue
+                        }
+                    }
+                }
+            }
+            // timer
+            _ = &mut timer => {
+                state.messages.push(String::from("hello!"));
+                rx += 1;
+                timer.as_mut().reset(Instant::now() + random_duration());
             }
         }
     }
 
-    //tokio::time::sleep(Duration::from_secs(5)).await;
-
     // move back to standard terminal
     crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(
-        io::stdout(),
-        crossterm::terminal::LeaveAlternateScreen
-    )?;
+    crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
 
     Ok(())
 }
