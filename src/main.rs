@@ -61,11 +61,24 @@ impl<'a> ChatState<'a> {
             return;
         }
 
+        // use names for the computed rectangles of canvas
+        let (status_chunk, messages_chunk, input_chunk) = (sections[0], sections[1], sections[2]);
+
+        // create the status area widget
         let status = Paragraph::new(self.status.clone())
             .block(Block::default().title("status").borders(Borders::ALL));
+
+        // calculate a scroll offset to keep newest message at the bottom of the window pane
+        let scroll_amt = self.messages.len()
+            .saturating_sub(messages_chunk.height.saturating_sub(2).into())
+            .try_into()
+            .unwrap_or(u16::MAX);
+        // create the messages pane, scrolling appropriately
         let messages = Paragraph::new(self.messages.join("\n"))
-            .block(Block::default().title("chat").borders(Borders::ALL));
-        let (status_chunk, messages_chunk, input_chunk) = (sections[0], sections[1], sections[2]);
+            .block(Block::default().title("chat").borders(Borders::ALL))
+            .scroll((scroll_amt, 0));
+
+
         f.render_widget(status, status_chunk);
         f.render_widget(messages, messages_chunk);
         f.render_widget(self.inputbox.widget(), input_chunk);
